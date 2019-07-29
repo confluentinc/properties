@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/magiconair/properties/assert"
+	"github.com/confluentinc/properties/assert"
 )
 
 var verbose = flag.Bool("verbose", false, "Verbose output")
