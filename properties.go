@@ -48,6 +48,11 @@ func PanicHandler(err error) {
 
 // -----------------------------------------------------------------------------
 
+type prefixedComment struct {
+	prefix string // prefix type (#, !)
+	val string    // The comment string after the prefix
+}
+
 // A Properties contains the key/value pairs from the properties input.
 // All values are stored in unexpanded form and are expanded at runtime
 type Properties struct {
@@ -65,10 +70,13 @@ type Properties struct {
 	m map[string]string
 
 	// Stores the comments per key.
-	c map[string][]string
+	c map[string][]prefixedComment
 
 	// Stores the keys in order of appearance.
 	k []string
+
+	// Stores any trailing comments if we want to preserveFormatting
+	trailingComments []prefixedComment
 }
 
 // NewProperties creates a new Properties struct with the default
@@ -78,7 +86,7 @@ func NewProperties() *Properties {
 		Prefix:  "${",
 		Postfix: "}",
 		m:       map[string]string{},
-		c:       map[string][]string{},
+		c:       map[string][]prefixedComment{},
 		k:       []string{},
 	}
 }
@@ -131,7 +139,7 @@ func (p *Properties) MustGet(key string) string {
 
 // ClearComments removes the comments for all keys.
 func (p *Properties) ClearComments() {
-	p.c = map[string][]string{}
+	p.c = map[string][]prefixedComment{}
 }
 
 // ----------------------------------------------------------------------------
@@ -142,7 +150,7 @@ func (p *Properties) GetComment(key string) string {
 	if !ok || len(comments) == 0 {
 		return ""
 	}
-	return comments[len(comments)-1]
+	return comments[len(comments)-1].val
 }
 
 // ----------------------------------------------------------------------------
@@ -150,7 +158,11 @@ func (p *Properties) GetComment(key string) string {
 // GetComments returns all comments that appeared before the given key or nil.
 func (p *Properties) GetComments(key string) []string {
 	if comments, ok := p.c[key]; ok {
-		return comments
+		var list []string
+		for _, comment := range comments {
+			list = append(list, comment.val)
+		}
+		return list
 	}
 	return nil
 }
@@ -159,7 +171,14 @@ func (p *Properties) GetComments(key string) []string {
 
 // SetComment sets the comment for the key.
 func (p *Properties) SetComment(key, comment string) {
-	p.c[key] = []string{comment}
+	p.c[key] = []prefixedComment{{"#", comment}}
+}
+
+// ----------------------------------------------------------------------------
+
+// SetComment sets the comment for the key.
+func (p *Properties) SetCommentWithPrefix(key, prefix string, comment string) {
+	p.c[key] = []prefixedComment{{prefix, comment}}
 }
 
 // ----------------------------------------------------------------------------
@@ -167,11 +186,23 @@ func (p *Properties) SetComment(key, comment string) {
 // SetComments sets the comments for the key. If the comments are nil then
 // all comments for this key are deleted.
 func (p *Properties) SetComments(key string, comments []string) {
+	p.SetCommentsWithPrefix(key, "#", comments)
+}
+
+// ----------------------------------------------------------------------------
+
+// SetComments sets the comments for the key. If the comments are nil then
+// all comments for this key are deleted.
+func (p *Properties) SetCommentsWithPrefix(key string, prefix string, comments []string) {
 	if comments == nil {
 		delete(p.c, key)
 		return
 	}
-	p.c[key] = comments
+	var list = make([]prefixedComment, 0, len(comments))
+	for _, comment := range comments {
+		list = append(list, prefixedComment{prefix, comment})
+	}
+	p.c[key] = list
 }
 
 // ----------------------------------------------------------------------------
@@ -592,7 +623,7 @@ func (p *Properties) Write(w io.Writer, enc Encoding) (n int, err error) {
 	return p.WriteComment(w, "", enc)
 }
 
-// WriteComment writes all unexpanced 'key = value' pairs to the given writer.
+// WriteComment writes all unexpanded 'key = value' pairs to the given writer.
 // If prefix is not empty then comments are written with a blank line and the
 // given prefix. The prefix should be either "# " or "! " to be compatible with
 // the properties file format. Otherwise, the properties parser will not be
@@ -609,7 +640,7 @@ func (p *Properties) WriteComment(w io.Writer, prefix string, enc Encoding) (n i
 				// don't print comments if they are all empty
 				allEmpty := true
 				for _, c := range comments {
-					if c != "" {
+					if strings.TrimSpace(c.val) != "" {
 						allEmpty = false
 						break
 					}
@@ -626,17 +657,62 @@ func (p *Properties) WriteComment(w io.Writer, prefix string, enc Encoding) (n i
 					}
 
 					for _, c := range comments {
-						x, err = fmt.Fprintf(w, "%s%s\n", prefix, encode(c, "", enc))
-						if err != nil {
-							return
+						comment := strings.TrimSpace(c.val)
+						if comment != "" {
+							x, err = fmt.Fprintf(w, "%s%s\n", prefix, encode(comment, "", enc))
+							if err != nil {
+								return
+							}
+							n += x
 						}
-						n += x
 					}
 				}
 			}
 		}
 
 		x, err = fmt.Fprintf(w, "%s = %s\n", encode(key, " :", enc), encode(value, "", enc))
+		if err != nil {
+			return
+		}
+		n += x
+	}
+	return
+}
+
+// WriteFormattedComment writes all unexpanded 'key = value' pairs to the given writer.
+// Comments are written out with their original preserved formatting. It returns the number of bytes
+// written and any write error encountered.
+func (p *Properties) WriteFormattedComment(w io.Writer, enc Encoding) (n int, err error) {
+	var x int
+	for _, key := range p.k {
+		value := p.m[key]
+
+		if comments, ok := p.c[key]; ok {
+			for _, c := range comments {
+				prefix := ""
+				if (c.prefix != "\n") {
+					prefix = c.prefix
+				}
+				x, err = fmt.Fprintf(w, "%s%s\n", prefix, encode(c.val, "", enc))
+				if err != nil {
+					return
+				}
+				n += x
+			}
+		}
+
+		x, err = fmt.Fprintf(w, "%s = %s\n", encode(key, " :", enc), encode(value, "", enc))
+		if err != nil {
+			return
+		}
+		n += x
+	}
+	for _, c := range p.trailingComments {
+		prefix := ""
+		if (c.prefix != "\n") {
+			prefix = c.prefix
+		}
+		x, err = fmt.Fprintf(w, "%s%s\n", prefix, encode(c.val, "", enc))
 		if err != nil {
 			return
 		}
